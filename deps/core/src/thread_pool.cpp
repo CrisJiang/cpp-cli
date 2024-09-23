@@ -16,6 +16,34 @@ public:
 	struct stThread {
 		std::thread thread_;
 		std::atomic<bool> is_stop_{ false };
+		int thread_uuid{ 0 };			//  用于记录thread uuid， detach后get_id()似乎一直拿到的是0
+		
+		//  看起来内部还是要实现比较方法？
+		bool operator==(const stThread& other) const {
+			return thread_uuid == other.thread_uuid; 
+		}
+
+		void set_thread_uuid() {
+			thread_uuid = (int)(thread_.get_id()._Get_underlying_id());
+		}
+		// 提供一个简单的标识符，用于哈希和比较
+		int get_thread_uuid() const {
+			return thread_uuid;
+		}
+	};
+
+	// 自定义比较函数
+	struct stThreadPtrEqual {
+		bool operator()(const std::shared_ptr<stThread>& lhs, const std::shared_ptr<stThread>& rhs) const {
+			return lhs->get_thread_uuid() == rhs->get_thread_uuid();
+		}
+	};
+
+	// 自定义哈希函数
+	struct stThreadPtrHash {
+		std::size_t operator()(const std::shared_ptr<stThread>& threadPtr) const {
+			return std::hash<int>()(threadPtr->get_thread_uuid());
+		}
 	};
 	//  创建线程池
 	void create_pool(int threads);
@@ -41,8 +69,8 @@ public:
 	//  任务队列
 	std::list<std::shared_ptr<stTask>> task_list_;
 
-	std::unordered_set<std::shared_ptr<stThread>> idle_threads_;
-	std::unordered_set<std::shared_ptr<stThread>> busy_threads_;
+	std::unordered_set<std::shared_ptr<stThread>, stThreadPtrHash, stThreadPtrEqual> idle_threads_;
+	std::unordered_set<std::shared_ptr<stThread>, stThreadPtrHash, stThreadPtrEqual> busy_threads_;
 
 	mutable std::mutex  mutex_;
 
@@ -55,9 +83,20 @@ void ThreadPool::Impl::create_pool(int threads)
 {
 	threads_num_ = threads;
 	for (int i = 0; i < threads_num_; i++) {
+
+		std::mutex mtx;
+		std::condition_variable cv;
+		bool thread_started = false;
 		auto thread = std::make_shared<stThread>();
 		//  创建std::thread
-		std::thread threadImpl([this, thread]() {
+		thread->thread_ = std::thread([this, thread, &mtx, &thread_started, &cv]() {
+			//  线程创建完毕，通知外部
+			LOG_DEBUG("thread created");
+			{
+				auto lock = std::unique_lock(mtx);
+				thread_started = true;
+				cv.notify_one();
+			}
 			while (!thread->is_stop_) {
 				//  获取一个task
 				auto task = this->get_task();
@@ -70,7 +109,13 @@ void ThreadPool::Impl::create_pool(int threads)
 				move_to_idle(thread);
 			}
 		});
-		thread->thread_ = std::move(threadImpl);
+		//  要确保线程创建完成， 否则线程id=0， 主线程等待，直到新线程启动
+		{
+			auto lock = std::unique_lock(mtx);
+			cv.wait(lock, [&]() { return thread_started; });
+		}
+		thread->set_thread_uuid();
+		LOG_DEBUG("thread id:{}", thread->get_thread_uuid());
 		thread->thread_.detach();
 		//  加入到空闲队列中
 		idle_threads_.insert(thread);
@@ -81,26 +126,34 @@ void ThreadPool::Impl::move_to_idle(std::shared_ptr<stThread> thread)
 {
 	//LOG_DEBUG("move_to_idle_list");
 	auto lock = std::unique_lock(mutex_);
-	if (busy_threads_.size() == 0)
+	if (busy_threads_.size() == 0) {
+		LOG_WARN("busy_threads_ empty!");
 		return;
+	}
 	//  提取原有的元素，加入到idle中
-	auto e = busy_threads_.extract(thread);
-	if (e) {
-		idle_threads_.insert(std::move(e));
+	auto node = busy_threads_.extract(thread);
+	if (!node.empty()) {
+		idle_threads_.insert(std::move(node));
 		//  通知等待线程
 		idle_cond_.notify_one();
 	}
+	else
+		LOG_WARN("node.empty()!");
 }
 
 void ThreadPool::Impl::move_to_busy(std::shared_ptr<stThread> thread)
 {
 	//LOG_DEBUG("move_to_busy_list");
 	auto lock = std::unique_lock(mutex_);
-	if (idle_threads_.size() == 0)
+	if (idle_threads_.size() == 0) {
+		LOG_WARN("idle_threads_ empty!");
 		return;
-	auto e = idle_threads_.extract(thread);
-	if (e)
-		busy_threads_.insert(std::move(e));
+	}
+	auto node = idle_threads_.extract(thread);
+	if (!node.empty())
+		busy_threads_.insert(std::move(node));
+	else
+		LOG_WARN("node.empty()!");
 }
 
 int ThreadPool::Impl::get_idle_thread_numbers()
@@ -151,11 +204,10 @@ std::shared_ptr<ThreadPool::Impl::stThread> ThreadPool::Impl::get_idle_thread()
 
 	//  获取一个空闲线程
 	auto it = idle_threads_.begin();
-	auto& idle_thread = *it;
-	//  从空闲列表中移除
-	idle_threads_.erase(it);
+	if (*it)
+		return *it;
 
-	return idle_thread;
+	return nullptr;
 }
 
 ThreadPool::ThreadPool(int nums)
@@ -182,4 +234,11 @@ void ThreadPool::assign(std::function<void()> task)
 	if (thread) {
 		impl_->move_to_busy(thread);
 	}
+}
+
+void ThreadPool::printSize()
+{
+	LOG_INFO("idle size:{}, busy size:{}",
+		impl_->get_idle_thread_numbers(),
+		impl_->get_busy_thread_numbers());
 }
