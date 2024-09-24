@@ -19,8 +19,12 @@ add_compile_definitions(QT_DISABLE_DEPRECATED_BEFORE=0x050F00)
 set(my_sources_tree1
     ./include/lib_export.h
     ./include/thread_pool.h
+    ./include/singleton.h
+    ./include/data_wrapper.h
 
     ./src/thread_pool.cpp
+    ./src/singleton.cpp
+    ./src/data_wrapper.cpp
 
     # qt项目添加国际化文件依赖
     )

@@ -100,11 +100,10 @@ void ThreadPool::Impl::create_pool(int threads)
 			while (!thread->is_stop_) {
 				//  获取一个task
 				auto task = this->get_task();
-
+				move_to_busy(thread);
 				//  执行task
 				if (task)
 					task->fn_();
-
 				//  设置回空闲 - 本线程需要设置回来空闲
 				move_to_idle(thread);
 			}
@@ -150,8 +149,10 @@ void ThreadPool::Impl::move_to_busy(std::shared_ptr<stThread> thread)
 		return;
 	}
 	auto node = idle_threads_.extract(thread);
-	if (!node.empty())
+	if (!node.empty()) {
+		LOG_INFO("move to busy node uuid:{}", node.value()->get_thread_uuid());
 		busy_threads_.insert(std::move(node));
+	}
 	else
 		LOG_WARN("node.empty()!");
 }
@@ -219,6 +220,7 @@ ThreadPool::ThreadPool(int nums)
 ThreadPool::~ThreadPool()
 {
 	//_run = false;
+	stop();
 	impl_->idle_cond_.notify_all(); // 唤醒所有线程执行
 	for (auto& thread : impl_->idle_threads_) {
 		if (thread->thread_.joinable())
@@ -229,11 +231,6 @@ ThreadPool::~ThreadPool()
 void ThreadPool::assign(std::function<void()> task)
 {
 	impl_->add_task(task);
-	//  获取空闲线程
-	auto thread = impl_->get_idle_thread();
-	if (thread) {
-		impl_->move_to_busy(thread);
-	}
 }
 
 void ThreadPool::printSize()
@@ -241,4 +238,13 @@ void ThreadPool::printSize()
 	LOG_INFO("idle size:{}, busy size:{}",
 		impl_->get_idle_thread_numbers(),
 		impl_->get_busy_thread_numbers());
+}
+
+void ThreadPool::stop()
+{
+	for (auto& t : impl_->busy_threads_) {
+		t->is_stop_ = true;
+		if (t->thread_.joinable())
+			t->thread_.join();
+	}
 }
